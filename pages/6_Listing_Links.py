@@ -20,9 +20,9 @@ sku_options = [None] + [row[0] for row in sku_rows]
 # Load existing links
 with conn.cursor() as cur:
     cur.execute("""
-        SELECT listing_id, etsy_listing_id, "SKU", listing_name, variation
+        SELECT listing_id, etsy_listing_id, "SKU", listing_name, variation, qty
         FROM listing_link
-        ORDER BY listing_name, variation
+        ORDER BY listing_name, variation, "SKU"
     """)
     link_cols = [desc[0] for desc in cur.description]
     link_rows = cur.fetchall()
@@ -35,7 +35,7 @@ tab_all, tab_add, tab_edit = st.tabs(["All Links", "Add Link", "Edit Link"])
 
 with tab_all:
     if not links_df.empty:
-        display = links_df[["etsy_listing_id", "listing_name", "variation", "SKU"]].copy()
+        display = links_df[["etsy_listing_id", "listing_name", "variation", "SKU", "qty"]].copy()
         display["variation"] = display["variation"].fillna("—")
         st.dataframe(display, use_container_width=True, hide_index=True)
     else:
@@ -44,7 +44,8 @@ with tab_all:
 # ── Tab: Add Link ─────────────────────────────────────────────────────────────
 
 with tab_add:
-    # Pull distinct (listing_id, variation) pairs from order_line_item not yet in listing_link
+    # All distinct (listing_id, variation) pairs from orders so user can add
+    # multiple SKU rows to the same listing/variation
     with conn.cursor() as cur:
         cur.execute("""
             SELECT oli.listing_id,
@@ -52,40 +53,31 @@ with tab_add:
                    MAX(oli.listing_name) AS listing_name
             FROM order_line_item oli
             WHERE oli.listing_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM listing_link ll
-                  WHERE ll.etsy_listing_id = oli.listing_id
-                    AND ll.variation IS NOT DISTINCT FROM oli.variation
-              )
             GROUP BY oli.listing_id, oli.variation
             ORDER BY listing_name, oli.variation
         """)
-        unlinked_rows = cur.fetchall()
+        all_pairs = cur.fetchall()
 
-    if not unlinked_rows:
-        st.info("All listing/variation combinations from your orders are already linked.")
+    if not all_pairs:
+        st.info("No orders imported yet.")
     else:
-        # Key: (listing_id, variation) → listing_name
-        unlinked = {(row[0], row[1]): row[2] for row in unlinked_rows}
-        unlinked_keys = list(unlinked.keys())
+        pair_map = {(row[0], row[1]): row[2] for row in all_pairs}
+        pair_keys = list(pair_map.keys())
 
-        def fmt_unlinked(key):
-            lid, _ = key
-            name = unlinked[key] or "(no name)"
-            return name
+        def fmt_pair(key):
+            return pair_map[key] or "(no name)"
 
-        # Selector lives outside the form so selection updates the preview immediately
         selected_key = st.selectbox(
             "Etsy Listing / Variation",
-            options=unlinked_keys,
-            format_func=fmt_unlinked,
+            options=pair_keys,
+            format_func=fmt_pair,
         )
         if selected_key:
             col_prev1, col_prev2 = st.columns(2)
             with col_prev1:
                 st.text_area(
                     "Listing Name",
-                    value=unlinked[selected_key] or "(no name)",
+                    value=pair_map[selected_key] or "(no name)",
                     height=80,
                     disabled=True,
                 )
@@ -97,12 +89,31 @@ with tab_add:
                     disabled=True,
                 )
 
+            # Show SKUs already linked to this listing/variation
+            if not links_df.empty:
+                existing = links_df[
+                    (links_df["etsy_listing_id"] == selected_key[0]) &
+                    (links_df["variation"].isna() if selected_key[1] is None
+                     else links_df["variation"] == selected_key[1])
+                ]
+                if not existing.empty:
+                    st.caption("Already linked SKUs for this listing/variation:")
+                    st.dataframe(
+                        existing[["SKU", "qty"]].reset_index(drop=True),
+                        use_container_width=False,
+                        hide_index=True,
+                    )
+
         with st.form("add_link"):
-            new_sku = st.selectbox(
-                "SKU",
-                options=sku_options,
-                format_func=lambda s: "— none —" if s is None else s,
-            )
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                new_sku = st.selectbox(
+                    "SKU",
+                    options=sku_options,
+                    format_func=lambda s: "— none —" if s is None else s,
+                )
+            with col_f2:
+                new_qty = st.number_input("Qty in Listing", min_value=1, step=1, value=1)
             submitted = st.form_submit_button("Add Link", type="primary")
 
         if submitted:
@@ -110,19 +121,19 @@ with tab_add:
                 st.error("SKU is required.")
             else:
                 sel_listing_id, sel_variation = selected_key
-                listing_name = unlinked.get(selected_key)
+                listing_name = pair_map.get(selected_key)
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO listing_link (etsy_listing_id, "SKU", listing_name, variation)
-                            VALUES (%s, %s, %s, %s)
+                            INSERT INTO listing_link (etsy_listing_id, "SKU", listing_name, variation, qty)
+                            VALUES (%s, %s, %s, %s, %s)
                             """,
-                            (sel_listing_id, new_sku, listing_name, sel_variation),
+                            (sel_listing_id, new_sku, listing_name, sel_variation, new_qty),
                         )
                     conn.commit()
                     label = f"{listing_name}{' — ' + sel_variation if sel_variation else ''}"
-                    st.success(f"Linked '{label}' → {new_sku}.")
+                    st.success(f"Linked '{label}' → {new_sku} (qty {new_qty}).")
                     st.rerun()
                 except Exception as e:
                     conn.rollback()
@@ -138,8 +149,9 @@ with tab_edit:
             row = links_df.loc[links_df["listing_id"] == lid].iloc[0]
             name = row["listing_name"] or "(no name)"
             var = row["variation"]
-            etsy_id = row["etsy_listing_id"]
-            return f"{name}{' — ' + var if var else ''} (#{etsy_id})"
+            sku = row["SKU"]
+            qty = row["qty"]
+            return f"{name}{' — ' + var if var else ''} · {sku} ×{qty}"
 
         selected_id = st.selectbox(
             "Select link to edit",
@@ -167,6 +179,12 @@ with tab_edit:
                     format_func=lambda s: "— none —" if s is None else s,
                     index=current_sku_idx,
                 )
+                edit_qty = st.number_input(
+                    "Qty in Listing",
+                    min_value=1,
+                    step=1,
+                    value=int(link["qty"]) if pd.notna(link["qty"]) else 1,
+                )
             col_save, col_del = st.columns(2)
             with col_save:
                 save = st.form_submit_button("Save Changes", type="primary")
@@ -177,8 +195,8 @@ with tab_edit:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'UPDATE listing_link SET "SKU" = %s WHERE listing_id = %s',
-                        (edit_sku, selected_id),
+                        'UPDATE listing_link SET "SKU" = %s, qty = %s WHERE listing_id = %s',
+                        (edit_sku, edit_qty, selected_id),
                     )
                 conn.commit()
                 st.success("Link updated.")

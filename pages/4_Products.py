@@ -11,6 +11,13 @@ except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
 
+# Load people for owner dropdown
+with conn.cursor() as cur:
+    cur.execute("SELECT person_id, person_name FROM people ORDER BY person_name")
+    person_rows = cur.fetchall()
+person_options = {row[0]: row[1] for row in person_rows}
+person_keys = [None] + list(person_options.keys())
+
 # Load filaments for dropdowns
 with conn.cursor() as cur:
     cur.execute("SELECT filament_id, filament_name FROM filaments ORDER BY filament_name")
@@ -28,7 +35,7 @@ material_keys = [None] + list(material_options.keys())
 # Load products (with material name and aggregated cost components)
 with conn.cursor() as cur:
     cur.execute("""
-        SELECT p.product_id, p."SKU", p.labor_minutes, p.material_id, m.name AS material_name,
+        SELECT p.product_id, p."SKU", p.labor_minutes, p.material_id, p.owner_id, m.name AS material_name,
                COALESCE(SUM(pt.grams_material * f.cost_per_gram), 0) AS filament_cost,
                COALESCE(SUM(pt.machine_minutes), 0) * 0.007 AS machine_cost,
                COALESCE(m.cost_per_unit * m.qty, 0) AS material_cost
@@ -36,7 +43,7 @@ with conn.cursor() as cur:
         LEFT JOIN materials m ON m.material_id = p.material_id
         LEFT JOIN parts pt ON pt.product_id = p.product_id
         LEFT JOIN filaments f ON f.filament_id = pt.filament_id
-        GROUP BY p.product_id, p."SKU", p.labor_minutes, p.material_id, m.name, m.cost_per_unit, m.qty
+        GROUP BY p.product_id, p."SKU", p.labor_minutes, p.material_id, p.owner_id, m.name, m.cost_per_unit, m.qty
         ORDER BY p."SKU"
     """)
     prod_cols = [desc[0] for desc in cur.description]
@@ -50,16 +57,16 @@ sku_col = prod_cols[1] if len(prod_cols) > 1 else "SKU"
 with conn.cursor() as cur:
     cur.execute("""
         SELECT ll."SKU",
-               AVG(oli.price) AS avg_revenue,
-               SUM(COALESCE(oli.qty, 1)) AS units_sold,
+               AVG(oli.price / NULLIF(total_ll.total_qty, 0)) AS avg_revenue,
+               SUM(COALESCE(oli.qty, 1) * ll.qty) AS units_sold,
                AVG(
-                   oli.price - (
+                   (oli.price - (
                        COALESCE(o.shipping_label_cost, 0)
                        + COALESCE(o.processing_fee, 0)
                        + COALESCE(o.transaction_fee, 0)
                        + COALESCE(o.taxes, 0)
                        - COALESCE(o.credits, 0)
-                   ) / NULLIF(item_counts.cnt, 0)
+                   ) / NULLIF(item_counts.cnt, 0)) / NULLIF(total_ll.total_qty, 0)
                ) AS avg_net_revenue
         FROM listing_link ll
         JOIN order_line_item oli ON oli.listing_id = ll.etsy_listing_id
@@ -70,6 +77,12 @@ with conn.cursor() as cur:
             FROM order_line_item
             GROUP BY order_id
         ) item_counts ON item_counts.order_id = oli.order_id
+        JOIN (
+            SELECT etsy_listing_id, variation, SUM(qty) AS total_qty
+            FROM listing_link
+            GROUP BY etsy_listing_id, variation
+        ) total_ll ON total_ll.etsy_listing_id = ll.etsy_listing_id
+            AND total_ll.variation IS NOT DISTINCT FROM ll.variation
         WHERE oli.price IS NOT NULL
         GROUP BY ll."SKU"
     """)
@@ -117,7 +130,7 @@ with tab_all:
 
 with tab_add:
     with st.form("add_product"):
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             new_sku = st.text_input("SKU")
         with col2:
@@ -128,6 +141,12 @@ with tab_add:
                 options=material_keys,
                 format_func=lambda mid: "— none —" if mid is None else material_options[mid],
             )
+        with col4:
+            new_owner_id = st.selectbox(
+                "Owner",
+                options=person_keys,
+                format_func=lambda pid: "— none —" if pid is None else person_options[pid],
+            )
         submitted = st.form_submit_button("Add Product", type="primary")
 
     if submitted:
@@ -137,8 +156,8 @@ with tab_add:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'INSERT INTO products ("SKU", labor_minutes, material_id) VALUES (%s, %s, %s)',
-                        (new_sku, new_labor or None, new_material_id),
+                        'INSERT INTO products ("SKU", labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s)',
+                        (new_sku, new_labor or None, new_material_id, new_owner_id),
                     )
                 conn.commit()
                 st.success(f"Added product '{new_sku}'.")
@@ -167,8 +186,13 @@ with tab_edit:
             if product["material_id"] in material_keys
             else 0
         )
+        current_owner_idx = (
+            person_keys.index(product["owner_id"])
+            if pd.notna(product.get("owner_id")) and product["owner_id"] in person_keys
+            else 0
+        )
         with st.form("edit_product"):
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 edit_sku = st.text_input("SKU", value=product[sku_col] or "")
             with col2:
@@ -182,18 +206,67 @@ with tab_edit:
                     format_func=lambda mid: "— none —" if mid is None else material_options[mid],
                     index=current_material_idx,
                 )
-            col_save, col_del = st.columns(2)
+            with col4:
+                edit_owner_id = st.selectbox(
+                    "Owner",
+                    options=person_keys,
+                    format_func=lambda pid: "— none —" if pid is None else person_options[pid],
+                    index=current_owner_idx,
+                )
+            col_save, col_copy, col_del = st.columns(3)
             with col_save:
                 save_product = st.form_submit_button("Save Changes", type="primary")
+            with col_copy:
+                copy_product = st.form_submit_button("Copy Product")
             with col_del:
                 delete_product = st.form_submit_button("Delete Product")
+
+        if copy_product:
+            new_copy_sku = product[sku_col] + "-copy"
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'INSERT INTO products ("SKU", labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s) RETURNING product_id',
+                        (
+                            new_copy_sku,
+                            int(product["labor_minutes"]) if pd.notna(product["labor_minutes"]) else None,
+                            int(product["material_id"]) if pd.notna(product["material_id"]) else None,
+                            int(product["owner_id"]) if pd.notna(product.get("owner_id")) else None,
+                        ),
+                    )
+                    new_pid = cur.fetchone()[0]
+                    # Load and copy all parts for this product
+                    cur.execute(
+                        "SELECT part_name, grams_material, filament_id, machine_minutes FROM parts WHERE product_id = %s",
+                        (selected_pid,),
+                    )
+                    for p in cur.fetchall():
+                        cur.execute(
+                            """
+                            INSERT INTO parts (part_name, product_id, grams_material, filament_id, machine_minutes)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (
+                                p[0] or None,
+                                new_pid,
+                                float(p[1]) if p[1] is not None else None,
+                                int(p[2]) if p[2] is not None else None,
+                                int(p[3]) if p[3] is not None else None,
+                            ),
+                        )
+                conn.commit()
+                st.success(f"Copied to '{new_copy_sku}' — select it from the dropdown to edit.")
+                st.rerun()
+            except Exception as e:
+                conn.rollback()
+                st.error(f"Failed: {e}")
 
         if save_product:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'UPDATE products SET "SKU"=%s, labor_minutes=%s, material_id=%s WHERE product_id=%s',
-                        (edit_sku, edit_labor or None, edit_material_id, selected_pid),
+                        'UPDATE products SET "SKU"=%s, labor_minutes=%s, material_id=%s, owner_id=%s WHERE product_id=%s',
+                        (edit_sku, edit_labor or None, edit_material_id, edit_owner_id, selected_pid),
                     )
                 conn.commit()
                 st.success("Product updated.")
@@ -219,7 +292,7 @@ with tab_edit:
 
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT p.part_id, p.part_name, p.color, p.grams_material,
+                SELECT p.part_id, p.part_name, p.grams_material,
                        p.machine_minutes, p.filament_id, f.filament_name, f.cost_per_gram
                 FROM parts p
                 LEFT JOIN filaments f ON f.filament_id = p.filament_id
@@ -233,7 +306,7 @@ with tab_edit:
 
         st.subheader("Parts")
         if not parts_df.empty:
-            display = parts_df[["part_name", "color", "grams_material", "machine_minutes", "filament_name"]].copy()
+            display = parts_df[["part_name", "grams_material", "machine_minutes", "filament_name"]].copy()
             st.dataframe(display, use_container_width=True, hide_index=True)
         else:
             st.info("No parts for this product yet.")
@@ -285,7 +358,6 @@ with tab_edit:
             col1, col2 = st.columns(2)
             with col1:
                 new_part_name = st.text_input("Part Name")
-                new_color = st.text_input("Color")
                 new_grams = st.number_input("Grams of Material", min_value=0.0, step=0.1, format="%.2f")
             with col2:
                 new_machine_min = st.number_input("Machine Minutes", min_value=0, step=1)
@@ -301,14 +373,13 @@ with tab_edit:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO parts (part_name, product_id, grams_material, color, filament_id, machine_minutes)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO parts (part_name, product_id, grams_material, filament_id, machine_minutes)
+                        VALUES (%s, %s, %s, %s, %s)
                         """,
                         (
                             new_part_name or None,
                             selected_pid,
                             new_grams or None,
-                            new_color or None,
                             new_filament_id,
                             new_machine_min or None,
                         ),
@@ -341,7 +412,6 @@ with tab_edit:
                 col1, col2 = st.columns(2)
                 with col1:
                     edit_part_name = st.text_input("Part Name", value=part["part_name"] or "")
-                    edit_color = st.text_input("Color", value=part["color"] or "")
                     edit_grams = st.number_input(
                         "Grams of Material", min_value=0.0, step=0.1, format="%.2f", value=float(part["grams_material"]) if pd.notna(part["grams_material"]) else 0.0
                     )
@@ -368,7 +438,6 @@ with tab_edit:
                             """
                             UPDATE parts SET
                                 part_name       = %s,
-                                color           = %s,
                                 grams_material  = %s,
                                 machine_minutes = %s,
                                 filament_id     = %s
@@ -376,7 +445,6 @@ with tab_edit:
                             """,
                             (
                                 edit_part_name or None,
-                                edit_color or None,
                                 edit_grams or None,
                                 edit_machine_min or None,
                                 edit_filament_id,

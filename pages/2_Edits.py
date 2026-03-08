@@ -11,6 +11,16 @@ except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
 
+# Load people for dropdown
+with conn.cursor() as cur:
+    cur.execute("SELECT person_id, person_name FROM people ORDER BY person_name")
+    person_rows = cur.fetchall()
+person_options = {row[0]: row[1] for row in person_rows}  # person_id → person_name
+person_keys = [None] + list(person_options.keys())
+
+# Build reverse lookup: name → person_id (for pre-selecting current value)
+person_name_to_id = {v: k for k, v in person_options.items()}
+
 # Load orders
 with conn.cursor() as cur:
     cur.execute("""
@@ -118,9 +128,13 @@ with st.form("edit_order"):
         )
 
     with col2:
-        fulfillment_person = st.text_input(
+        current_person_id = person_name_to_id.get(order["fulfillment_person"])
+        current_person_idx = person_keys.index(current_person_id) if current_person_id in person_keys else 0
+        selected_person_id = st.selectbox(
             "Fulfillment Person",
-            value=order["fulfillment_person"] or "",
+            options=person_keys,
+            format_func=lambda pid: "— none —" if pid is None else person_options[pid],
+            index=current_person_idx,
         )
         date_shipped = st.date_input(
             "Date Shipped",
@@ -144,7 +158,7 @@ if submitted:
                 (
                     shipping_label_cost or None,
                     net_revenue or None,
-                    fulfillment_person or None,
+                    person_options[selected_person_id] if selected_person_id else None,
                     date_shipped,
                     selected_id,
                 ),
