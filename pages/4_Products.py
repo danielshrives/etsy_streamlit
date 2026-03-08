@@ -311,13 +311,6 @@ with tab_edit:
 
         parts_df = pd.DataFrame(part_rows, columns=part_cols) if part_rows else pd.DataFrame(columns=part_cols)
 
-        st.subheader("Parts")
-        if not parts_df.empty:
-            display = parts_df[["part_name", "grams_material", "machine_minutes", "filament_name"]].copy()
-            st.dataframe(display, use_container_width=True, hide_index=True)
-        else:
-            st.info("No parts for this product yet.")
-
         # ── Cost breakdown ────────────────────────────────────────────────────
 
         st.markdown("#### Cost to Produce")
@@ -358,122 +351,71 @@ with tab_edit:
 
         st.divider()
 
-        # ── Add part ──────────────────────────────────────────────────────────
+        # ── Parts table (editable) ────────────────────────────────────────────
 
-        st.markdown("#### Add Part")
-        with st.form("add_part"):
-            col1, col2 = st.columns(2)
-            with col1:
-                new_part_name = st.text_input("Part Name")
-                new_grams = st.number_input("Grams of Material", min_value=0.0, step=0.1, format="%.2f")
-            with col2:
-                new_machine_min = st.number_input("Machine Minutes", min_value=0, step=1)
-                new_filament_id = st.selectbox(
-                    "Filament",
-                    options=filament_keys,
-                    format_func=lambda fid: "— none —" if fid is None else filament_options[fid],
-                )
-            add_part = st.form_submit_button("Add Part", type="primary")
+        st.subheader("Parts")
 
-        if add_part:
+        filament_name_list = [""] + list(filament_options.values())
+        filament_name_to_id = {v: k for k, v in filament_options.items()}
+
+        # Header row
+        h1, h2, h3, h4, h5, h6 = st.columns([3, 2, 2, 3, 1, 1])
+        h1.caption("Part Name")
+        h2.caption("Grams")
+        h3.caption("Machine Min")
+        h4.caption("Filament")
+
+        # Existing parts — one row each
+        for _, part in parts_df.iterrows():
+            pid = int(part["part_id"])
+            c1, c2, c3, c4, c5, c6 = st.columns([3, 2, 2, 3, 1, 1])
+            name_val = c1.text_input("name", value=part["part_name"] or "", key=f"pname_{pid}", label_visibility="collapsed")
+            grams_val = c2.number_input("grams", value=float(part["grams_material"] or 0), min_value=0.0, step=0.1, format="%.2f", key=f"pgrams_{pid}", label_visibility="collapsed")
+            mins_val = c3.number_input("mins", value=int(part["machine_minutes"]) if pd.notna(part["machine_minutes"]) else 0, min_value=0, step=1, key=f"pmins_{pid}", label_visibility="collapsed")
+            current_fil = filament_options.get(part["filament_id"], "") if pd.notna(part["filament_id"]) else ""
+            fil_val = c4.selectbox("filament", options=filament_name_list, index=filament_name_list.index(current_fil) if current_fil in filament_name_list else 0, key=f"pfil_{pid}", label_visibility="collapsed")
+            if c5.button("Save", key=f"psave_{pid}"):
+                fid = filament_name_to_id.get(fil_val) if fil_val else None
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE parts SET part_name=%s, grams_material=%s, machine_minutes=%s, filament_id=%s WHERE part_id=%s",
+                            (name_val or None, grams_val or None, mins_val or None, fid, pid),
+                        )
+                    conn.commit()
+                    st.rerun()
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"Failed: {e}")
+            if c6.button("Del", key=f"pdel_{pid}"):
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM parts WHERE part_id = %s", (pid,))
+                    conn.commit()
+                    st.rerun()
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"Failed: {e}")
+
+        # Add new part row
+        st.caption("— Add Part —")
+        a1, a2, a3, a4, a5, _ = st.columns([3, 2, 2, 3, 1, 1])
+        new_name_val = a1.text_input("name", value="", key=f"pname_new_{selected_pid}", label_visibility="collapsed", placeholder="Part Name")
+        new_grams_val = a2.number_input("grams", value=0.0, min_value=0.0, step=0.1, format="%.2f", key=f"pgrams_new_{selected_pid}", label_visibility="collapsed")
+        new_mins_val = a3.number_input("mins", value=0, min_value=0, step=1, key=f"pmins_new_{selected_pid}", label_visibility="collapsed")
+        new_fil_val = a4.selectbox("filament", options=filament_name_list, key=f"pfil_new_{selected_pid}", label_visibility="collapsed")
+        if a5.button("Add", key=f"padd_{selected_pid}", type="primary"):
+            fid = filament_name_to_id.get(new_fil_val) if new_fil_val else None
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        INSERT INTO parts (part_name, product_id, grams_material, filament_id, machine_minutes)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (
-                            new_part_name or None,
-                            selected_pid,
-                            new_grams or None,
-                            new_filament_id,
-                            new_machine_min or None,
-                        ),
+                        "INSERT INTO parts (part_name, product_id, grams_material, filament_id, machine_minutes) VALUES (%s, %s, %s, %s, %s)",
+                        (new_name_val or None, selected_pid, new_grams_val or None, fid, new_mins_val or None),
                     )
                 conn.commit()
-                st.success("Part added.")
                 st.rerun()
             except Exception as e:
                 conn.rollback()
                 st.error(f"Failed: {e}")
-
-        # ── Edit part ─────────────────────────────────────────────────────────
-
-        if not parts_df.empty:
-            st.markdown("#### Edit Part")
-            selected_part_id = st.selectbox(
-                "Select part to edit",
-                options=parts_df["part_id"].tolist(),
-                format_func=lambda pid: parts_df.loc[parts_df["part_id"] == pid, "part_name"].iloc[0],
-            )
-            part = parts_df[parts_df["part_id"] == selected_part_id].iloc[0]
-
-            current_filament_idx = (
-                filament_keys.index(part["filament_id"])
-                if part["filament_id"] in filament_keys
-                else 0
-            )
-
-            with st.form("edit_part"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    edit_part_name = st.text_input("Part Name", value=part["part_name"] or "")
-                    edit_grams = st.number_input(
-                        "Grams of Material", min_value=0.0, step=0.1, format="%.2f", value=float(part["grams_material"]) if pd.notna(part["grams_material"]) else 0.0
-                    )
-                with col2:
-                    edit_machine_min = st.number_input(
-                        "Machine Minutes", min_value=0, step=1, value=int(part["machine_minutes"]) if pd.notna(part["machine_minutes"]) else 0
-                    )
-                    edit_filament_id = st.selectbox(
-                        "Filament",
-                        options=filament_keys,
-                        format_func=lambda fid: "— none —" if fid is None else filament_options[fid],
-                        index=current_filament_idx,
-                    )
-                col_save, col_del = st.columns(2)
-                with col_save:
-                    save_part = st.form_submit_button("Save Changes", type="primary")
-                with col_del:
-                    delete_part = st.form_submit_button("Delete Part")
-
-            if save_part:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE parts SET
-                                part_name       = %s,
-                                grams_material  = %s,
-                                machine_minutes = %s,
-                                filament_id     = %s
-                            WHERE part_id = %s
-                            """,
-                            (
-                                edit_part_name or None,
-                                edit_grams or None,
-                                edit_machine_min or None,
-                                edit_filament_id,
-                                selected_part_id,
-                            ),
-                        )
-                    conn.commit()
-                    st.success("Part updated.")
-                    st.rerun()
-                except Exception as e:
-                    conn.rollback()
-                    st.error(f"Failed: {e}")
-
-            if delete_part:
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("DELETE FROM parts WHERE part_id = %s", (selected_part_id,))
-                    conn.commit()
-                    st.success("Part deleted.")
-                    st.rerun()
-                except Exception as e:
-                    conn.rollback()
-                    st.error(f"Failed: {e}")
 
 conn.close()

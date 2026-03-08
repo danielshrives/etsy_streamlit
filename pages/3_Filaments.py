@@ -1,6 +1,23 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timezone
 from db import get_connection
+
+
+def time_since(dt):
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{delta.days}d ago"
 
 st.set_page_config(page_title="Filaments", page_icon="🧵", layout="wide")
 st.title("Filaments")
@@ -13,7 +30,7 @@ except Exception as e:
 
 with conn.cursor() as cur:
     cur.execute("""
-        SELECT filament_id, filament_name, filament_vendor, cost_per_gram
+        SELECT filament_id, filament_name, filament_vendor, cost_per_gram, last_updated
         FROM filaments
         ORDER BY filament_name
     """)
@@ -30,7 +47,8 @@ if not df.empty:
     display["cost_per_gram"] = display["cost_per_gram"].apply(
         lambda x: f"${float(x):.4f}" if x is not None else "—"
     )
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    display["last_updated"] = display["last_updated"].apply(time_since)
+    st.dataframe(display.drop(columns=["filament_id"]), use_container_width=True, hide_index=True)
 else:
     st.info("No filaments yet.")
 
@@ -40,13 +58,36 @@ st.divider()
 
 st.subheader("Add Filament")
 with st.form("add_filament"):
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         new_name = st.text_input("Filament Name")
     with col2:
         new_vendor = st.text_input("Vendor")
-    with col3:
-        new_cost = st.number_input("Cost per Gram ($)", min_value=0.0, step=0.0001, format="%.4f")
+
+    st.markdown("**Cost Calculator**")
+    calc1, calc2, calc3, calc4 = st.columns(4)
+    with calc1:
+        roll_kg = st.number_input("Roll Size (kg)", min_value=0.0, step=0.25, format="%.3f")
+    with calc2:
+        roll_cost = st.number_input("Roll Cost ($)", min_value=0.0, step=0.01, format="%.2f")
+    with calc3:
+        roll_taxes = st.number_input("Taxes ($)", min_value=0.0, step=0.01, format="%.2f")
+    with calc4:
+        roll_shipping = st.number_input("Shipping ($)", min_value=0.0, step=0.01, format="%.2f")
+
+    total_cost = roll_cost + roll_taxes + roll_shipping
+    grams = roll_kg * 1000
+    calc_cpg = total_cost / grams if grams > 0 else 0.0
+    st.caption(
+        f"Calculated cost per gram: **${calc_cpg:.4f}**"
+        + (f"  ·  Total cost ${total_cost:.2f} / {grams:.0f}g" if grams > 0 else "")
+    )
+
+    new_cost = st.number_input(
+        "Cost per Gram ($) — override if needed",
+        min_value=0.0, step=0.0001, format="%.4f",
+        value=calc_cpg,
+    )
     submitted = st.form_submit_button("Add Filament", type="primary")
 
 if submitted:
@@ -56,7 +97,7 @@ if submitted:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO filaments (filament_name, filament_vendor, cost_per_gram) VALUES (%s, %s, %s)",
+                    "INSERT INTO filaments (filament_name, filament_vendor, cost_per_gram, last_updated) VALUES (%s, %s, %s, NOW())",
                     (new_name, new_vendor or None, new_cost or None),
                 )
             conn.commit()
@@ -103,7 +144,7 @@ if not df.empty:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE filaments SET filament_name=%s, filament_vendor=%s, cost_per_gram=%s WHERE filament_id=%s",
+                    "UPDATE filaments SET filament_name=%s, filament_vendor=%s, cost_per_gram=%s, last_updated=NOW() WHERE filament_id=%s",
                     (edit_name, edit_vendor or None, edit_cost or None, selected_id),
                 )
             conn.commit()
