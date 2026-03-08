@@ -35,7 +35,7 @@ material_keys = [None] + list(material_options.keys())
 # Load products (with material name and aggregated cost components)
 with conn.cursor() as cur:
     cur.execute("""
-        SELECT p.product_id, p."SKU", p.labor_minutes, p.material_id, p.owner_id, m.name AS material_name,
+        SELECT p.product_id, p."SKU", p.short_name, p.labor_minutes, p.material_id, p.owner_id, m.name AS material_name,
                COALESCE(SUM(pt.grams_material * f.cost_per_gram), 0) AS filament_cost,
                COALESCE(SUM(pt.machine_minutes), 0) * 0.007 AS machine_cost,
                COALESCE(m.cost_per_unit * m.qty, 0) AS material_cost
@@ -43,7 +43,7 @@ with conn.cursor() as cur:
         LEFT JOIN materials m ON m.material_id = p.material_id
         LEFT JOIN parts pt ON pt.product_id = p.product_id
         LEFT JOIN filaments f ON f.filament_id = pt.filament_id
-        GROUP BY p.product_id, p."SKU", p.labor_minutes, p.material_id, p.owner_id, m.name, m.cost_per_unit, m.qty
+        GROUP BY p.product_id, p."SKU", p.short_name, p.labor_minutes, p.material_id, p.owner_id, m.name, m.cost_per_unit, m.qty
         ORDER BY p."SKU"
     """)
     prod_cols = [desc[0] for desc in cur.description]
@@ -99,7 +99,7 @@ tab_all, tab_add, tab_edit = st.tabs(["All Products", "Add Product", "Edit Produ
 with tab_all:
     if not prod_df.empty:
         LABOR_RATE = 20.0 / 60.0
-        display = prod_df[[sku_col, "labor_minutes", "filament_cost", "machine_cost", "material_cost"]].copy()
+        display = prod_df[[sku_col, "short_name", "labor_minutes", "filament_cost", "machine_cost", "material_cost"]].copy()
         display["total_cost"] = (
             display["filament_cost"].astype(float)
             + display["machine_cost"].astype(float)
@@ -113,7 +113,7 @@ with tab_all:
             display["units_sold"] = prod_df["units_sold"].fillna(0).astype(int)
             display["net_margin"] = display["avg_net_revenue"].astype(float) - display["total_cost"]
 
-        cols = [sku_col, "total_cost"]
+        cols = [sku_col, "short_name", "total_cost"]
         if has_rev:
             cols += ["avg_revenue", "avg_net_revenue", "net_margin", "units_sold"]
         display = display[cols]
@@ -130,18 +130,21 @@ with tab_all:
 
 with tab_add:
     with st.form("add_product"):
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2 = st.columns(2)
         with col1:
             new_sku = st.text_input("SKU")
         with col2:
-            new_labor = st.number_input("Labor Minutes", min_value=0, step=1)
+            new_short_name = st.text_input("Short Name")
+        col3, col4, col5 = st.columns(3)
         with col3:
+            new_labor = st.number_input("Labor Minutes", min_value=0, step=1)
+        with col4:
             new_material_id = st.selectbox(
                 "Material",
                 options=material_keys,
                 format_func=lambda mid: "— none —" if mid is None else material_options[mid],
             )
-        with col4:
+        with col5:
             new_owner_id = st.selectbox(
                 "Owner",
                 options=person_keys,
@@ -156,8 +159,8 @@ with tab_add:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'INSERT INTO products ("SKU", labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s)',
-                        (new_sku, new_labor or None, new_material_id, new_owner_id),
+                        'INSERT INTO products ("SKU", short_name, labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s, %s)',
+                        (new_sku, new_short_name or None, new_labor or None, new_material_id, new_owner_id),
                     )
                 conn.commit()
                 st.success(f"Added product '{new_sku}'.")
@@ -192,21 +195,24 @@ with tab_edit:
             else 0
         )
         with st.form("edit_product"):
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2 = st.columns(2)
             with col1:
                 edit_sku = st.text_input("SKU", value=product[sku_col] or "")
             with col2:
+                edit_short_name = st.text_input("Short Name", value=product["short_name"] or "")
+            col3, col4, col5 = st.columns(3)
+            with col3:
                 edit_labor = st.number_input(
                     "Labor Minutes", min_value=0, step=1, value=int(product["labor_minutes"]) if pd.notna(product["labor_minutes"]) else 0
                 )
-            with col3:
+            with col4:
                 edit_material_id = st.selectbox(
                     "Material",
                     options=material_keys,
                     format_func=lambda mid: "— none —" if mid is None else material_options[mid],
                     index=current_material_idx,
                 )
-            with col4:
+            with col5:
                 edit_owner_id = st.selectbox(
                     "Owner",
                     options=person_keys,
@@ -226,9 +232,10 @@ with tab_edit:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'INSERT INTO products ("SKU", labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s) RETURNING product_id',
+                        'INSERT INTO products ("SKU", short_name, labor_minutes, material_id, owner_id) VALUES (%s, %s, %s, %s, %s) RETURNING product_id',
                         (
                             new_copy_sku,
+                            product["short_name"] or None,
                             int(product["labor_minutes"]) if pd.notna(product["labor_minutes"]) else None,
                             int(product["material_id"]) if pd.notna(product["material_id"]) else None,
                             int(product["owner_id"]) if pd.notna(product.get("owner_id")) else None,
@@ -265,8 +272,8 @@ with tab_edit:
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        'UPDATE products SET "SKU"=%s, labor_minutes=%s, material_id=%s, owner_id=%s WHERE product_id=%s',
-                        (edit_sku, edit_labor or None, edit_material_id, edit_owner_id, selected_pid),
+                        'UPDATE products SET "SKU"=%s, short_name=%s, labor_minutes=%s, material_id=%s, owner_id=%s WHERE product_id=%s',
+                        (edit_sku, edit_short_name or None, edit_labor or None, edit_material_id, edit_owner_id, selected_pid),
                     )
                 conn.commit()
                 st.success("Product updated.")
