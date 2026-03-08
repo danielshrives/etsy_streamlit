@@ -40,27 +40,27 @@ col5.metric("Revenue This Month", f"${revenue_this_month:,.2f}")
 
 st.divider()
 
-# Recent orders table
-st.subheader("Recent Orders")
+# Revenue over time chart
+import pandas as pd
+
+st.subheader("Revenue Over Time")
 with conn.cursor() as cur:
     cur.execute("""
-        SELECT etsy_order_id, sale_date, order_total, buyer_paid_shipping,
-               coupon_name, coupon_amount, date_shipped
+        SELECT sale_date, SUM(order_total) AS revenue
         FROM orders
-        ORDER BY sale_date DESC
-        LIMIT 20
+        WHERE sale_date IS NOT NULL
+        GROUP BY sale_date
+        ORDER BY sale_date
     """)
-    cols = [desc[0] for desc in cur.description]
-    rows = cur.fetchall()
+    rev_rows = cur.fetchall()
 
 conn.close()
 
-import pandas as pd
-if rows:
-    df = pd.DataFrame(rows, columns=cols)
-    df["order_total"] = df["order_total"].apply(lambda x: f"${x:,.2f}" if x else "")
-    df["buyer_paid_shipping"] = df["buyer_paid_shipping"].apply(lambda x: f"${x:,.2f}" if x else "")
-    df["coupon_amount"] = df["coupon_amount"].apply(lambda x: f"${x:,.2f}" if x else "")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+if rev_rows:
+    rev_df = pd.DataFrame(rev_rows, columns=["date", "revenue"])
+    rev_df["revenue"] = pd.to_numeric(rev_df["revenue"], errors="coerce")
+    rev_df["cumulative_revenue"] = rev_df["revenue"].cumsum()
+    rev_df = rev_df.set_index("date")
+    st.line_chart(rev_df["cumulative_revenue"], y_label="Cumulative Revenue ($)", x_label="Date")
 else:
     st.info("No orders found. Use the Import page to load your Etsy CSV.")
