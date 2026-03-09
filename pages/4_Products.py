@@ -67,7 +67,12 @@ with conn.cursor() as cur:
                        + COALESCE(o.taxes, 0)
                        - COALESCE(o.credits, 0)
                    ) / NULLIF(item_counts.cnt, 0)) / NULLIF(total_ll.total_qty, 0)
-               ) AS avg_net_revenue
+               ) AS avg_net_revenue,
+               AVG(
+                   CASE WHEN o.shipping_label_cost IS NOT NULL
+                   THEN o.shipping_label_cost - COALESCE(o.buyer_paid_shipping, 0)
+                   END
+               ) AS avg_net_shipping
         FROM listing_link ll
         JOIN order_line_item oli ON oli.listing_id = ll.etsy_listing_id
             AND oli.variation IS NOT DISTINCT FROM ll.variation
@@ -87,10 +92,39 @@ with conn.cursor() as cur:
         GROUP BY ll."SKU"
     """)
     rev_rows = cur.fetchall()
-rev_df = pd.DataFrame(rev_rows, columns=["SKU", "avg_revenue", "units_sold", "avg_net_revenue"]) if rev_rows else pd.DataFrame(columns=["SKU", "avg_revenue", "units_sold", "avg_net_revenue"])
+rev_df = pd.DataFrame(rev_rows, columns=["SKU", "avg_revenue", "units_sold", "avg_net_revenue", "avg_net_shipping"]) if rev_rows else pd.DataFrame(columns=["SKU", "avg_revenue", "units_sold", "avg_net_revenue", "avg_net_shipping"])
+
+# Load typical packaging cost per SKU
+with conn.cursor() as cur:
+    cur.execute("""
+        SELECT
+            ll."SKU",
+            AVG(
+                (COALESCE(pkg.packaging_cost, 0) + COALESCE(pkg.bag_cost, 0)
+                 + COALESCE(pkg.pack_material_cost, 0) + COALESCE(pkg.ship_label_cost, 0)
+                 + COALESCE(pkg.sticker_cost, 0))
+                / NULLIF(item_counts.cnt, 0)
+            ) AS avg_pkg_cost
+        FROM listing_link ll
+        JOIN order_line_item oli
+            ON  oli.listing_id = ll.etsy_listing_id
+            AND oli.variation IS NOT DISTINCT FROM ll.variation
+        JOIN orders o ON o.order_id = oli.order_id
+        JOIN (
+            SELECT order_id, SUM(COALESCE(qty, 1)) AS cnt
+            FROM order_line_item
+            GROUP BY order_id
+        ) item_counts ON item_counts.order_id = oli.order_id
+        JOIN packaging pkg ON pkg.packaging_type_id = o.packing_cost_id
+        GROUP BY ll."SKU"
+    """)
+    pkg_rows = cur.fetchall()
+pkg_df = pd.DataFrame(pkg_rows, columns=["SKU", "avg_pkg_cost"]) if pkg_rows else pd.DataFrame(columns=["SKU", "avg_pkg_cost"])
 
 if not prod_df.empty and not rev_df.empty:
     prod_df = prod_df.merge(rev_df, left_on=sku_col, right_on="SKU", how="left")
+if not prod_df.empty and not pkg_df.empty:
+    prod_df = prod_df.merge(pkg_df, left_on=sku_col, right_on="SKU", how="left", suffixes=("", "_pkg"))
 
 tab_all, tab_add, tab_edit = st.tabs(["All Products", "Add Product", "Edit Product"])
 
@@ -107,21 +141,49 @@ with tab_all:
             + display["labor_minutes"].fillna(0).astype(float) * LABOR_RATE
         )
         has_rev = "avg_revenue" in prod_df.columns
+        has_pkg = "avg_pkg_cost" in prod_df.columns
         if has_rev:
             display["avg_revenue"] = prod_df["avg_revenue"]
             display["avg_net_revenue"] = prod_df["avg_net_revenue"]
+            display["ship_cost"] = prod_df["avg_net_shipping"]
             display["units_sold"] = prod_df["units_sold"].fillna(0).astype(int)
-            display["net_margin"] = display["avg_net_revenue"].astype(float) - display["total_cost"]
+            display["pkg_cost"] = pd.to_numeric(prod_df["avg_pkg_cost"], errors="coerce") if has_pkg else 0.0
+            display["net_margin"] = (
+                display["avg_net_revenue"].astype(float)
+                - display["total_cost"]
+                - display["pkg_cost"].fillna(0)
+            )
+            display["total_net_value"] = display["net_margin"].astype(float) * display["units_sold"]
 
-        cols = [sku_col, "short_name", "total_cost"]
-        if has_rev:
-            cols += ["avg_revenue", "avg_net_revenue", "net_margin", "units_sold"]
+        cols = [sku_col, "short_name", "avg_revenue", "avg_net_revenue", "total_cost", "ship_cost", "pkg_cost", "net_margin", "units_sold", "total_net_value"] if has_rev else [sku_col, "short_name", "total_cost"]
         display = display[cols]
 
-        display["total_cost"] = display["total_cost"].apply(lambda x: f"${x:.2f}")
-        if has_rev:
-            for col in ["avg_revenue", "avg_net_revenue", "net_margin"]:
+        for col in ["avg_revenue", "avg_net_revenue", "total_cost", "ship_cost", "pkg_cost", "net_margin", "total_net_value"]:
+            if col in display.columns:
                 display[col] = display[col].apply(lambda x: f"${float(x):.2f}" if pd.notna(x) else "—")
+
+        display.columns = (
+            ["SKU", "Name", "Avg Revenue", "Avg Net Revenue", "COGS", "Ship Cost", "Pkg Cost", "Net Margin", "Units Sold", "Total Net Value"]
+            if has_rev else ["SKU", "Name", "COGS"]
+        )
+        with st.expander("Column definitions"):
+            st.markdown(
+                "**Avg Revenue** — Average line-item price received per unit of this SKU across all orders,"
+                " proportionally split when a listing bundles multiple SKUs\n\n"
+                "**Avg Net Revenue** — Avg Revenue minus a proportional share of order-level fees"
+                " (shipping label + processing fee + transaction fee + taxes − credits),"
+                " split evenly across line items in the order\n\n"
+                "**COGS** — Cost of Goods Sold: filament (grams × $/gram) + machine (minutes × $0.007/min)"
+                " + labor (minutes × $0.33/min at $20/hr) + material (cost per unit × qty)\n\n"
+                "**Ship Cost** — Average net shipping cost (label cost − buyer paid shipping) per order,"
+                " only for orders where a label cost was recorded\n\n"
+                "**Pkg Cost** — Average packaging cost (sum of all packaging cost fields) divided by line items in the order,"
+                " averaged across orders where packaging was recorded\n\n"
+                "**Net Margin** — Avg Net Revenue − COGS − Pkg Cost: estimated profit per unit\n\n"
+                "**Units Sold** — Total units of this SKU fulfilled across all orders\n\n"
+                "**Total Net Value** — Net Margin × Units Sold: cumulative profit across all units sold"
+            )
+
         st.dataframe(display, use_container_width=True, hide_index=True)
     else:
         st.info("No products yet.")

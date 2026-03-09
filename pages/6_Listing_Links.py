@@ -95,7 +95,9 @@ with tab_add:
         pair_keys = list(pair_map.keys())
 
         def fmt_pair(key):
-            return pair_map[key] or "(no name)"
+            name = pair_map[key] or "(no name)"
+            variation = key[1]
+            return f"{name} — {variation}" if variation else name
 
         selected_key = st.selectbox(
             "Etsy Listing / Variation",
